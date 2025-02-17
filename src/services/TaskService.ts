@@ -46,7 +46,10 @@ export class TaskService {
 
         // Get the repository root path
         this.repoRoot = gitBaseDir || this.getRepoRoot();
-        this.git = simpleGit({ baseDir: this.repoRoot });
+        this.git = simpleGit({
+            baseDir: this.repoRoot,
+            maxConcurrentProcesses: 1
+        });
     }
 
     private getRepoRoot(): string {
@@ -61,6 +64,15 @@ export class TaskService {
             this.mainBranch = branches.current;
         }
         return this.mainBranch;
+    }
+
+    private async doesBranchExist(branchName: string): Promise<boolean> {
+        try {
+            const branches = await this.git.branch();
+            return branches.all.includes(branchName);
+        } catch {
+            return false;
+        }
     }
 
     async findAll(filters?: Partial<Task>): Promise<Task[]> {
@@ -90,7 +102,8 @@ export class TaskService {
             // Create a Git branch for the task
             const branchName = `task/${createdTask.id}`;
             try {
-                await this.git.checkoutLocalBranch(branchName);
+                const mainBranch = await this.getMainBranch();
+                await this.git.checkoutBranch(branchName, mainBranch);
             } catch (error) {
                 throw new GitError(`Failed to create branch ${branchName}: ${error instanceof Error ? error.message : 'Unknown error'}`);
             }
@@ -113,7 +126,7 @@ export class TaskService {
                 try {
                     const mainBranch = await this.getMainBranch();
                     await this.git.checkout(mainBranch);
-                    await this.git.deleteLocalBranch(`task/${createdTask.id}`, true);
+                    await this.git.deleteLocalBranch(`task/${createdTask.id}`);
                 } catch {
                     // Ignore cleanup errors
                 }
@@ -199,30 +212,53 @@ export class TaskService {
         }
 
         const branchName = `task/${taskId}`;
+        const mainBranch = await this.getMainBranch();
+
+        // First update task status - do this regardless of Git operations
+        await this.taskRepo.update(taskId, { status: TaskStatus.COMPLETED });
+
+        // Check if the task branch exists
+        const branchExists = await this.doesBranchExist(branchName);
+        if (!branchExists) {
+            // If no branch exists, task is already completed
+            console.log(`No branch ${branchName} found - task marked as completed`);
+            return;
+        }
+
         try {
-            // Get the main branch name
-            const mainBranch = await this.getMainBranch();
+            // Get current branch to restore it later if needed
+            const currentBranch = (await this.git.revparse(['--abbrev-ref', 'HEAD'])).trim();
 
-            // First update task status
-            await this.taskRepo.update(taskId, { status: TaskStatus.COMPLETED });
-
-            try {
-                // Switch to main branch and merge
+            // Switch to main branch if not already there
+            if (currentBranch !== mainBranch) {
                 await this.git.checkout(mainBranch);
-                await this.git.merge([branchName]);
+            }
 
-                // Then try to delete the branch
-                await this.git.deleteLocalBranch(branchName, true);
-            } catch (gitError) {
-                // If Git operations fail, revert the status update
-                await this.taskRepo.update(taskId, { status: task.status });
-                throw gitError;
-            }
+            // Attempt to merge the task branch
+            console.log(`Merging branch ${branchName} into ${mainBranch}...`);
+            await this.git.merge([branchName]);
+
+            // Delete the task branch (without force)
+            console.log(`Deleting branch ${branchName}...`);
+            await this.git.deleteLocalBranch(branchName);
+
+            console.log('Task completed successfully');
         } catch (error) {
-            if (error instanceof GitError) {
-                throw error;
+            console.error('Git operation failed:', error);
+
+            // Try to abort any ongoing merge
+            try {
+                await this.git.merge(['--abort']);
+            } catch (abortError) {
+                console.error('Failed to abort merge:', abortError);
             }
-            throw new DatabaseError(`Failed to complete task: ${error instanceof Error ? error.message : 'Unknown error'}`);
+
+            // Revert task status
+            await this.taskRepo.update(taskId, { status: task.status });
+
+            throw new GitError(
+                `Failed to complete task: ${error instanceof Error ? error.message : 'Unknown error'}`
+            );
         }
     }
 }
