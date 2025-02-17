@@ -5,12 +5,6 @@ import { getDatabase } from '../database/schema.js';
 
 export class SQLiteTaskRepository implements TaskRepository {
     private db: BetterSqlite3Database;
-
-    constructor() {
-        this.db = getDatabase();
-        this.setupPreparedStatements();
-    }
-
     private statements: {
         create: BetterSqlite3.Statement | undefined;
         findById: BetterSqlite3.Statement | undefined;
@@ -22,6 +16,11 @@ export class SQLiteTaskRepository implements TaskRepository {
         update: undefined,
         delete: undefined
     };
+
+    constructor(db?: BetterSqlite3Database) {
+        this.db = db || getDatabase();
+        this.setupPreparedStatements();
+    }
 
     private setupPreparedStatements(): void {
         this.statements.create = this.db.prepare(`

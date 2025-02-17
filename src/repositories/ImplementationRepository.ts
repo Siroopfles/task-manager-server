@@ -5,28 +5,35 @@ import { getDatabase } from '../database/schema.js';
 
 export class SQLiteImplementationRepository implements ImplementationRepository {
     private db: BetterSqlite3Database;
-
-    constructor() {
-        this.db = getDatabase();
-        this.setupPreparedStatements();
-    }
-
     private statements: {
         create: BetterSqlite3.Statement | undefined;
+        findById: BetterSqlite3.Statement | undefined;
         findByTaskId: BetterSqlite3.Statement | undefined;
         update: BetterSqlite3.Statement | undefined;
         delete: BetterSqlite3.Statement | undefined;
+        getAll: BetterSqlite3.Statement | undefined;
     } = {
         create: undefined,
+        findById: undefined,
         findByTaskId: undefined,
         update: undefined,
-        delete: undefined
+        delete: undefined,
+        getAll: undefined
     };
+
+    constructor(db?: BetterSqlite3Database) {
+        this.db = db || getDatabase();
+        this.setupPreparedStatements();
+    }
 
     private setupPreparedStatements(): void {
         this.statements.create = this.db.prepare(`
             INSERT INTO implementations (id, task_id, pattern_type, pattern_data, success_rating, created_at)
             VALUES (?, ?, ?, ?, ?, ?)
+        `);
+
+        this.statements.findById = this.db.prepare(`
+            SELECT * FROM implementations WHERE id = ?
         `);
 
         this.statements.findByTaskId = this.db.prepare(`
@@ -37,13 +44,42 @@ export class SQLiteImplementationRepository implements ImplementationRepository 
             UPDATE implementations 
             SET pattern_type = coalesce(?, pattern_type),
                 pattern_data = coalesce(?, pattern_data),
-                success_rating = coalesce(?, success_rating)
+                success_rating = ?
             WHERE id = ?
         `);
 
         this.statements.delete = this.db.prepare(`
             DELETE FROM implementations WHERE id = ?
         `);
+
+        this.statements.getAll = this.db.prepare(`
+            SELECT * FROM implementations ORDER BY created_at DESC
+        `);
+    }
+
+    private findById(id: string): Implementation | null {
+        try {
+            if (!this.statements.findById) {
+                throw new DatabaseError('FindById statement not initialized');
+            }
+
+            const impl = this.statements.findById.get(id);
+            if (!impl) {
+                return null;
+            }
+
+            const validationResult = ImplementationSchema.safeParse(impl);
+            if (!validationResult.success) {
+                throw new ValidationError(`Invalid implementation data in database: ${validationResult.error.message}`);
+            }
+
+            return impl as Implementation;
+        } catch (error: unknown) {
+            if (error instanceof ValidationError) {
+                throw error;
+            }
+            throw new DatabaseError(`Failed to find implementation: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
     }
 
     async create(impl: Omit<Implementation, 'id' | 'created_at'>): Promise<Implementation> {
@@ -113,10 +149,7 @@ export class SQLiteImplementationRepository implements ImplementationRepository 
                 throw new DatabaseError('Update statement not initialized');
             }
 
-            // First check if the implementation exists
-            const existingImpls = await this.findByTaskId(implUpdate.task_id ?? '');
-            const existingImpl = existingImpls.find(impl => impl.id === id);
-            
+            const existingImpl = this.findById(id);
             if (!existingImpl) {
                 throw new NotFoundError('Implementation', id);
             }
@@ -154,14 +187,8 @@ export class SQLiteImplementationRepository implements ImplementationRepository 
                 throw new DatabaseError('Delete statement not initialized');
             }
 
-            // First check if the implementation exists
-            const allImpls = await Promise.all(
-                this.db.prepare('SELECT task_id FROM implementations WHERE id = ?').all(id)
-                    .map(async (row: any) => this.findByTaskId(row.task_id))
-            );
-            
-            const implExists = allImpls.flat().some(impl => impl.id === id);
-            if (!implExists) {
+            const existingImpl = this.findById(id);
+            if (!existingImpl) {
                 throw new NotFoundError('Implementation', id);
             }
 
@@ -171,6 +198,30 @@ export class SQLiteImplementationRepository implements ImplementationRepository 
                 throw error;
             }
             throw new DatabaseError(`Failed to delete implementation: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+    }
+
+    async getAllImplementations(): Promise<Implementation[]> {
+        try {
+            if (!this.statements.getAll) {
+                throw new DatabaseError('GetAll statement not initialized');
+            }
+
+            const implementations = this.statements.getAll.all();
+
+            // Validate each implementation
+            return implementations.map((impl: unknown) => {
+                const validationResult = ImplementationSchema.safeParse(impl);
+                if (!validationResult.success) {
+                    throw new ValidationError(`Invalid implementation data in database: ${validationResult.error.message}`);
+                }
+                return impl as Implementation;
+            });
+        } catch (error: unknown) {
+            if (error instanceof ValidationError) {
+                throw error;
+            }
+            throw new DatabaseError(`Failed to get all implementations: ${error instanceof Error ? error.message : 'Unknown error'}`);
         }
     }
 }

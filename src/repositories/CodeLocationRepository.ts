@@ -5,28 +5,33 @@ import { getDatabase } from '../database/schema.js';
 
 export class SQLiteCodeLocationRepository implements CodeLocationRepository {
     private db: BetterSqlite3Database;
-
-    constructor() {
-        this.db = getDatabase();
-        this.setupPreparedStatements();
-    }
-
     private statements: {
         create: BetterSqlite3.Statement | undefined;
+        findById: BetterSqlite3.Statement | undefined;
         findByTaskId: BetterSqlite3.Statement | undefined;
         update: BetterSqlite3.Statement | undefined;
         delete: BetterSqlite3.Statement | undefined;
     } = {
         create: undefined,
+        findById: undefined,
         findByTaskId: undefined,
         update: undefined,
         delete: undefined
     };
 
+    constructor(db?: BetterSqlite3Database) {
+        this.db = db || getDatabase();
+        this.setupPreparedStatements();
+    }
+
     private setupPreparedStatements(): void {
         this.statements.create = this.db.prepare(`
             INSERT INTO code_locations (id, task_id, file_path, start_line, end_line, git_branch, git_commit, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+
+        this.statements.findById = this.db.prepare(`
+            SELECT * FROM code_locations WHERE id = ?
         `);
 
         this.statements.findByTaskId = this.db.prepare(`
@@ -37,9 +42,9 @@ export class SQLiteCodeLocationRepository implements CodeLocationRepository {
             UPDATE code_locations 
             SET file_path = coalesce(?, file_path),
                 start_line = coalesce(?, start_line),
-                end_line = coalesce(?, end_line),
-                git_branch = coalesce(?, git_branch),
-                git_commit = coalesce(?, git_commit)
+                end_line = ?,
+                git_branch = ?,
+                git_commit = ?
             WHERE id = ?
         `);
 
@@ -87,6 +92,31 @@ export class SQLiteCodeLocationRepository implements CodeLocationRepository {
         }
     }
 
+    private findById(id: string): CodeLocation | null {
+        try {
+            if (!this.statements.findById) {
+                throw new DatabaseError('FindById statement not initialized');
+            }
+
+            const location = this.statements.findById.get(id);
+            if (!location) {
+                return null;
+            }
+
+            const validationResult = CodeLocationSchema.safeParse(location);
+            if (!validationResult.success) {
+                throw new ValidationError(`Invalid code location data in database: ${validationResult.error.message}`);
+            }
+
+            return location as CodeLocation;
+        } catch (error: unknown) {
+            if (error instanceof ValidationError) {
+                throw error;
+            }
+            throw new DatabaseError(`Failed to find code location: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+    }
+
     async findByTaskId(taskId: string): Promise<CodeLocation[]> {
         try {
             if (!this.statements.findByTaskId) {
@@ -117,10 +147,7 @@ export class SQLiteCodeLocationRepository implements CodeLocationRepository {
                 throw new DatabaseError('Update statement not initialized');
             }
 
-            // First check if the location exists
-            const existingLocations = await this.findByTaskId(locationUpdate.task_id ?? '');
-            const existingLocation = existingLocations.find(loc => loc.id === id);
-            
+            const existingLocation = this.findById(id);
             if (!existingLocation) {
                 throw new NotFoundError('CodeLocation', id);
             }
@@ -160,15 +187,8 @@ export class SQLiteCodeLocationRepository implements CodeLocationRepository {
                 throw new DatabaseError('Delete statement not initialized');
             }
 
-            // First check if the location exists by getting all locations and finding the matching one
-            // This is not the most efficient way, but it ensures we throw NotFoundError consistently
-            const allLocations = await Promise.all(
-                this.db.prepare('SELECT task_id FROM code_locations WHERE id = ?').all(id)
-                    .map(async (row: any) => this.findByTaskId(row.task_id))
-            );
-            
-            const locationExists = allLocations.flat().some(loc => loc.id === id);
-            if (!locationExists) {
+            const existingLocation = this.findById(id);
+            if (!existingLocation) {
                 throw new NotFoundError('CodeLocation', id);
             }
 

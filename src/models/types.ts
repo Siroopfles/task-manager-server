@@ -12,7 +12,7 @@ export const TaskStatus = {
 export const TaskSchema = z.object({
     id: z.string().uuid(),
     title: z.string().min(1),
-    description: z.string().optional(),
+    description: z.string().nullable().optional(),
     priority: z.number().int().min(1).max(5),
     complexity: z.number().int().min(1).max(5),
     status: z.enum([
@@ -30,9 +30,9 @@ export const CodeLocationSchema = z.object({
     task_id: z.string().uuid(),
     file_path: z.string(),
     start_line: z.number().int().positive(),
-    end_line: z.number().int().positive().optional(),
-    git_branch: z.string().optional(),
-    git_commit: z.string().optional(),
+    end_line: z.number().int().positive().nullable().optional(),
+    git_branch: z.string().nullable().optional(),
+    git_commit: z.string().nullable().optional(),
     created_at: z.number()
 });
 
@@ -41,7 +41,7 @@ export const ImplementationSchema = z.object({
     task_id: z.string().uuid(),
     pattern_type: z.string(),
     pattern_data: z.string(),
-    success_rating: z.number().min(0).max(1).optional(),
+    success_rating: z.number().min(0).max(1).nullable().optional(),
     created_at: z.number()
 });
 
@@ -71,6 +71,7 @@ export interface ImplementationRepository {
     findByTaskId(taskId: string): Promise<Implementation[]>;
     update(id: string, impl: Partial<Implementation>): Promise<Implementation>;
     delete(id: string): Promise<void>;
+    getAllImplementations(): Promise<Implementation[]>;
 }
 
 // Error Types

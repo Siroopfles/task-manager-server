@@ -1,4 +1,8 @@
 import { SimpleGit, simpleGit } from 'simple-git';
+import { join } from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+import { Database } from 'better-sqlite3';
 import {
     Task,
     CodeLocation,
@@ -6,11 +10,13 @@ import {
     TaskStatus,
     ValidationError,
     GitError,
-    DatabaseError
+    DatabaseError,
+    NotFoundError
 } from '../models/types.js';
 import { SQLiteTaskRepository } from '../repositories/TaskRepository.js';
 import { SQLiteCodeLocationRepository } from '../repositories/CodeLocationRepository.js';
 import { SQLiteImplementationRepository } from '../repositories/ImplementationRepository.js';
+import { getDatabase } from '../database/schema.js';
 
 interface CreateTaskOptions {
     title: string;
@@ -29,12 +35,44 @@ export class TaskService {
     private codeLocationRepo: SQLiteCodeLocationRepository;
     private implRepo: SQLiteImplementationRepository;
     private git: SimpleGit;
+    private repoRoot: string;
+    private mainBranch: string | null = null;
 
-    constructor() {
-        this.taskRepo = new SQLiteTaskRepository();
-        this.codeLocationRepo = new SQLiteCodeLocationRepository();
-        this.implRepo = new SQLiteImplementationRepository();
-        this.git = simpleGit();
+    constructor(db?: Database, gitBaseDir?: string) {
+        const dbInstance = db || getDatabase();
+        this.taskRepo = new SQLiteTaskRepository(dbInstance);
+        this.codeLocationRepo = new SQLiteCodeLocationRepository(dbInstance);
+        this.implRepo = new SQLiteImplementationRepository(dbInstance);
+
+        // Get the repository root path
+        this.repoRoot = gitBaseDir || this.getRepoRoot();
+        this.git = simpleGit({ baseDir: this.repoRoot });
+    }
+
+    private getRepoRoot(): string {
+        const __filename = fileURLToPath(import.meta.url);
+        const __dirname = dirname(__filename);
+        return join(__dirname, '..', '..');
+    }
+
+    private async getMainBranch(): Promise<string> {
+        if (!this.mainBranch) {
+            const branches = await this.git.branch();
+            this.mainBranch = branches.current;
+        }
+        return this.mainBranch;
+    }
+
+    async findAll(filters?: Partial<Task>): Promise<Task[]> {
+        return this.taskRepo.findAll(filters);
+    }
+
+    async updateTaskStatus(taskId: string, status: keyof typeof TaskStatus): Promise<Task> {
+        const task = await this.taskRepo.findById(taskId);
+        if (!task) {
+            throw new NotFoundError('Task', taskId);
+        }
+        return this.taskRepo.update(taskId, { status: TaskStatus[status] });
     }
 
     async createTask(options: CreateTaskOptions): Promise<Task> {
@@ -73,6 +111,8 @@ export class TaskService {
             // Clean up Git branch if task creation fails
             if (error instanceof GitError && createdTask) {
                 try {
+                    const mainBranch = await this.getMainBranch();
+                    await this.git.checkout(mainBranch);
                     await this.git.deleteLocalBranch(`task/${createdTask.id}`, true);
                 } catch {
                     // Ignore cleanup errors
@@ -82,12 +122,6 @@ export class TaskService {
         }
     }
 
-    async updateTaskStatus(taskId: string, status: keyof typeof TaskStatus): Promise<Task> {
-        // Access the value using TaskStatus[status]
-        const statusValue = TaskStatus[status];
-        return this.taskRepo.update(taskId, { status: statusValue });
-    }
-
     async addCodeLocation(taskId: string, location: {
         filePath: string;
         startLine: number;
@@ -95,7 +129,7 @@ export class TaskService {
     }): Promise<CodeLocation> {
         const task = await this.taskRepo.findById(taskId);
         if (!task) {
-            throw new ValidationError(`Task ${taskId} not found`);
+            throw new NotFoundError('Task', taskId);
         }
 
         const branchName = `task/${taskId}`;
@@ -125,7 +159,7 @@ export class TaskService {
     async recordImplementation(taskId: string, patternType: string, patternData: string, successRating?: number): Promise<Implementation> {
         const task = await this.taskRepo.findById(taskId);
         if (!task) {
-            throw new ValidationError(`Task ${taskId} not found`);
+            throw new NotFoundError('Task', taskId);
         }
 
         return this.implRepo.create({
@@ -143,7 +177,7 @@ export class TaskService {
     }> {
         const task = await this.taskRepo.findById(taskId);
         if (!task) {
-            throw new ValidationError(`Task ${taskId} not found`);
+            throw new NotFoundError('Task', taskId);
         }
 
         const [codeLocations, implementations] = await Promise.all([
@@ -161,27 +195,31 @@ export class TaskService {
     async completeTask(taskId: string): Promise<void> {
         const task = await this.taskRepo.findById(taskId);
         if (!task) {
-            throw new ValidationError(`Task ${taskId} not found`);
+            throw new NotFoundError('Task', taskId);
         }
 
         const branchName = `task/${taskId}`;
         try {
-            // Update task status
+            // Get the main branch name
+            const mainBranch = await this.getMainBranch();
+
+            // First update task status
             await this.taskRepo.update(taskId, { status: TaskStatus.COMPLETED });
 
-            // Get the main branch name (could be main or master)
-            const mainBranch = (await this.git.branch()).current;
+            try {
+                // Switch to main branch and merge
+                await this.git.checkout(mainBranch);
+                await this.git.merge([branchName]);
 
-            // Attempt to merge the task branch
-            await this.git.checkout(mainBranch);
-            await this.git.merge([branchName]);
-
-            // Delete the task branch after successful merge
-            await this.git.deleteLocalBranch(branchName, true);
+                // Then try to delete the branch
+                await this.git.deleteLocalBranch(branchName, true);
+            } catch (gitError) {
+                // If Git operations fail, revert the status update
+                await this.taskRepo.update(taskId, { status: task.status });
+                throw gitError;
+            }
         } catch (error) {
             if (error instanceof GitError) {
-                // Revert status update if Git operations fail
-                await this.taskRepo.update(taskId, { status: task.status });
                 throw error;
             }
             throw new DatabaseError(`Failed to complete task: ${error instanceof Error ? error.message : 'Unknown error'}`);
