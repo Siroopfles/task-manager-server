@@ -1,169 +1,249 @@
-import { Router, Request, Response, NextFunction } from 'express';
-import { body, param, query, validationResult } from 'express-validator';
+import express from 'express';
 import { TaskService } from '../services/TaskService.js';
-import { TaskStatus, ValidationError } from '../models/types.js';
+import { ValidationError } from '../models/types.js';
 
-const router = Router();
+const router = express.Router();
 
-// Request type definitions
-interface CreateTaskRequest extends Request {
-    body: {
-        title: string;
-        description?: string;
-        priority: number;
-        complexity: number;
-        initialCodeLocation?: {
-            filePath: string;
-            startLine: number;
-            endLine?: number;
-        };
-    };
-}
-
-interface AddCodeLocationRequest extends Request {
-    params: { id: string };
-    body: {
-        filePath: string;
-        startLine: number;
-        endLine?: number;
-    };
-}
-
-interface RecordImplementationRequest extends Request {
-    params: { id: string };
-    body: {
-        patternType: string;
-        patternData: string;
-        successRating?: number;
-    };
-}
-
-// Get TaskService instance (supports injection for testing)
-const getTaskService = (req: Request): TaskService => {
-    return (req as any).taskService || new TaskService();
-};
-
-// Validation middleware
-const createTaskValidation = [
-    body('title').notEmpty().trim().escape(),
-    body('priority').isInt({ min: 1, max: 5 }),
-    body('complexity').isInt({ min: 1, max: 5 }),
-    body('description').optional().trim().escape(),
-    body('initialCodeLocation')
-        .optional()
-        .isObject()
-        .custom(value => {
-            if (value) {
-                if (!value.filePath || !value.startLine) {
-                    throw new Error('Initial code location requires filePath and startLine');
-                }
-            }
-            return true;
-        })
-];
-
-const statusValidation = [
-    query('status')
-        .optional()
-        .custom(value => {
-            if (value && !(value in TaskStatus)) {
-                throw new Error('Invalid task status');
-            }
-            return true;
-        })
-];
-
-const updateTaskValidation = [
-    param('id').isUUID(),
-    body('status').optional().isIn(Object.values(TaskStatus)),
-    body('priority').optional().isInt({ min: 1, max: 5 }),
-    body('complexity').optional().isInt({ min: 1, max: 5 }),
-    body('description').optional().trim().escape()
-];
-
-// Validation error handler
-const handleValidationErrors = (req: Request, res: Response, next: NextFunction) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-        throw new ValidationError(errors.array().map(err => err.msg).join(', '));
-    }
-    next();
-};
-
-// Create a new task
-router.post('/', createTaskValidation, handleValidationErrors, async (req: CreateTaskRequest, res: Response, next: NextFunction) => {
+/**
+ * @swagger
+ * /tasks:
+ *   get:
+ *     summary: Get all tasks
+ *     tags: [Tasks]
+ *     responses:
+ *       200:
+ *         description: List of tasks
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: array
+ *               items:
+ *                 $ref: '#/components/schemas/Task'
+ */
+router.get('/', async (req, res, next) => {
     try {
-        const taskService = getTaskService(req);
-        const task = await taskService.createTask({
-            title: req.body.title,
-            description: req.body.description,
-            priority: req.body.priority,
-            complexity: req.body.complexity,
-            initialCodeLocation: req.body.initialCodeLocation
-        });
-        res.status(201).json(task);
-    } catch (error) {
-        next(error);
-    }
-});
-
-// Get all tasks with optional status filter
-router.get('/', statusValidation, handleValidationErrors, async (req: Request, res: Response, next: NextFunction) => {
-    try {
-        const status = req.query.status as keyof typeof TaskStatus | undefined;
-        const taskService = getTaskService(req);
-        const tasks = await taskService.findAll(status ? { status: TaskStatus[status] } : undefined);
+        const taskService = new TaskService();
+        const tasks = await taskService.findAll();
         res.json(tasks);
     } catch (error) {
         next(error);
     }
 });
 
-// Get task by ID with details
-router.get('/:id', [
-    param('id').isUUID(),
-    handleValidationErrors
-], async (req: Request, res: Response, next: NextFunction) => {
+/**
+ * @swagger
+ * /tasks/{id}:
+ *   get:
+ *     summary: Get task by ID
+ *     tags: [Tasks]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Task ID
+ *     responses:
+ *       200:
+ *         description: Task details with code locations and implementations
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 task:
+ *                   $ref: '#/components/schemas/Task'
+ *                 codeLocations:
+ *                   type: array
+ *                   items:
+ *                     $ref: '#/components/schemas/CodeLocation'
+ *                 implementations:
+ *                   type: array
+ *                   items:
+ *                     $ref: '#/components/schemas/Implementation'
+ *       404:
+ *         $ref: '#/components/responses/NotFound'
+ */
+router.get('/:id', async (req, res, next) => {
     try {
-        const taskService = getTaskService(req);
-        const taskDetails = await taskService.getTaskWithDetails(req.params.id);
-        res.json(taskDetails);
+        const taskService = new TaskService();
+        const details = await taskService.getTaskWithDetails(req.params.id);
+        res.json(details);
     } catch (error) {
         next(error);
     }
 });
 
-// Add code location to task
-router.post('/:id/locations', [
-    param('id').isUUID(),
-    body('filePath').notEmpty().trim(),
-    body('startLine').isInt({ min: 1 }),
-    body('endLine').optional().isInt({ min: 1 }),
-    handleValidationErrors
-], async (req: AddCodeLocationRequest, res: Response, next: NextFunction) => {
+/**
+ * @swagger
+ * /tasks:
+ *   post:
+ *     summary: Create a new task
+ *     tags: [Tasks]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               title:
+ *                 type: string
+ *               description:
+ *                 type: string
+ *               priority:
+ *                 type: number
+ *                 minimum: 1
+ *                 maximum: 5
+ *               complexity:
+ *                 type: number
+ *                 minimum: 1
+ *                 maximum: 5
+ *               initialCodeLocation:
+ *                 type: object
+ *                 properties:
+ *                   filePath:
+ *                     type: string
+ *                   startLine:
+ *                     type: number
+ *                   endLine:
+ *                     type: number
+ *             required:
+ *               - title
+ *               - priority
+ *               - complexity
+ *     responses:
+ *       201:
+ *         description: Created task
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Task'
+ *       400:
+ *         $ref: '#/components/responses/ValidationError'
+ */
+router.post('/', async (req, res, next) => {
     try {
-        const taskService = getTaskService(req);
-        const location = await taskService.addCodeLocation(req.params.id, {
-            filePath: req.body.filePath,
-            startLine: req.body.startLine,
-            endLine: req.body.endLine
-        });
+        if (!req.body.title || !req.body.priority || !req.body.complexity) {
+            throw new ValidationError('Missing required fields');
+        }
+
+        const taskService = new TaskService();
+        const task = await taskService.createTask(req.body);
+        res.status(201).json(task);
+    } catch (error) {
+        next(error);
+    }
+});
+
+/**
+ * @swagger
+ * /tasks/{id}/locations:
+ *   post:
+ *     summary: Add a code location to a task
+ *     tags: [Tasks]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Task ID
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               filePath:
+ *                 type: string
+ *               startLine:
+ *                 type: number
+ *               endLine:
+ *                 type: number
+ *             required:
+ *               - filePath
+ *               - startLine
+ *     responses:
+ *       201:
+ *         description: Created code location
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/CodeLocation'
+ *       400:
+ *         $ref: '#/components/responses/ValidationError'
+ *       404:
+ *         $ref: '#/components/responses/NotFound'
+ */
+router.post('/:id/locations', async (req, res, next) => {
+    try {
+        if (!req.body.filePath || !req.body.startLine) {
+            throw new ValidationError('Missing required fields');
+        }
+
+        const taskService = new TaskService();
+        const location = await taskService.addCodeLocation(req.params.id, req.body);
         res.status(201).json(location);
     } catch (error) {
         next(error);
     }
 });
 
-// Record implementation for task
-router.post('/:id/implementations', [
-    param('id').isUUID(),
-    body('patternType').notEmpty().trim(),
-    body('patternData').notEmpty(),
-    body('successRating').optional().isFloat({ min: 0, max: 1 }),
-    handleValidationErrors
-], async (req: RecordImplementationRequest, res: Response, next: NextFunction) => {
+/**
+ * @swagger
+ * /tasks/{id}/implementations:
+ *   post:
+ *     summary: Record an implementation pattern for a task
+ *     tags: [Tasks]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Task ID
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               patternType:
+ *                 type: string
+ *               patternData:
+ *                 type: string
+ *               successRating:
+ *                 type: number
+ *                 minimum: 0
+ *                 maximum: 1
+ *             required:
+ *               - patternType
+ *               - patternData
+ *     responses:
+ *       201:
+ *         description: Created implementation record
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Implementation'
+ *       400:
+ *         $ref: '#/components/responses/ValidationError'
+ *       404:
+ *         $ref: '#/components/responses/NotFound'
+ */
+router.post('/:id/implementations', async (req, res, next) => {
     try {
-        const taskService = getTaskService(req);
+        if (!req.body.patternType || !req.body.patternData) {
+            throw new ValidationError('Missing required fields');
+        }
+
+        const taskService = new TaskService();
         const implementation = await taskService.recordImplementation(
             req.params.id,
             req.body.patternType,
@@ -176,15 +256,31 @@ router.post('/:id/implementations', [
     }
 });
 
-// Complete task
-router.post('/:id/complete', [
-    param('id').isUUID(),
-    handleValidationErrors
-], async (req: Request, res: Response, next: NextFunction) => {
+/**
+ * @swagger
+ * /tasks/{id}/complete:
+ *   post:
+ *     summary: Mark a task as completed and merge its branch
+ *     tags: [Tasks]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Task ID
+ *     responses:
+ *       200:
+ *         description: Task completed successfully
+ *       404:
+ *         $ref: '#/components/responses/NotFound'
+ */
+router.post('/:id/complete', async (req, res, next) => {
     try {
-        const taskService = getTaskService(req);
+        const taskService = new TaskService();
         await taskService.completeTask(req.params.id);
-        res.status(200).json({ message: 'Task completed successfully' });
+        res.sendStatus(200);
     } catch (error) {
         next(error);
     }
