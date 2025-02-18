@@ -12,11 +12,11 @@ import { TaskService } from './services/TaskService.js';
 import { PatternAnalysisService } from './services/PatternAnalysisService.js';
 import { TaskStatus, ValidationError, GitError, DatabaseError } from './models/types.js';
 import { SQLiteImplementationRepository } from './repositories/ImplementationRepository.js';
-import { getDatabase } from './database/schema.js';
 import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { MCPConfig } from './models/mcpConfig.js';
+import { getDatabase } from './database/schema.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -26,11 +26,13 @@ const configPath = join(__dirname, '..', 'mcp.config.json');
 const mcpConfig = JSON.parse(readFileSync(configPath, 'utf-8')) as MCPConfig;
 
 // Initialize services
+console.log('Initializing services...');
 const taskService = new TaskService();
 const implRepo = new SQLiteImplementationRepository(getDatabase());
 const patternService = new PatternAnalysisService(implRepo);
 
 // Create server instance
+console.log('Creating MCP server...');
 const server = new Server(
     {
         name: mcpConfig.name,
@@ -54,6 +56,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 // Handle tool calls
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    console.log(`Executing tool: ${request.params.name}`);
     try {
         switch (request.params.name) {
             case 'create_task': {
@@ -125,10 +128,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }
 
             case 'get_task_details': {
-                const args = z.object({
-                    taskId: z.string().uuid()
-                }).parse(request.params.arguments);
-
+                const args = z.object({ taskId: z.string().uuid() }).parse(request.params.arguments);
                 const details = await taskService.getTaskWithDetails(args.taskId);
                 return {
                     content: [{ type: 'text', text: JSON.stringify(details, null, 2) }],
@@ -136,21 +136,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }
 
             case 'complete_task': {
-                const args = z.object({
-                    taskId: z.string().uuid()
-                }).parse(request.params.arguments);
-
-                await taskService.completeTask(args.taskId);
-                return {
-                    content: [{ type: 'text', text: 'Task completed successfully' }],
-                };
+                const args = z.object({ taskId: z.string().uuid() }).parse(request.params.arguments);
+                try {
+                    await taskService.completeTask(args.taskId);
+                    return {
+                        content: [{ type: 'text', text: 'Task completed successfully' }],
+                    };
+                } catch (error) {
+                    if (error instanceof GitError) {
+                        console.error('Git operation failed:', error);
+                        throw new McpError(ErrorCode.InternalError, `Git operation failed: ${error.message}. Please ensure you're not on the task branch and try again.`);
+                    }
+                    throw error;
+                }
             }
 
             case 'analyze_task_patterns': {
-                const args = z.object({
-                    taskId: z.string().uuid()
-                }).parse(request.params.arguments);
-
+                const args = z.object({ taskId: z.string().uuid() }).parse(request.params.arguments);
                 const patterns = await patternService.analyzeTaskPatterns(args.taskId);
                 return {
                     content: [{ type: 'text', text: JSON.stringify(patterns, null, 2) }],
@@ -158,10 +160,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }
 
             case 'get_pattern_recommendations': {
-                const args = z.object({
-                    taskId: z.string().uuid()
-                }).parse(request.params.arguments);
-
+                const args = z.object({ taskId: z.string().uuid() }).parse(request.params.arguments);
                 const recommendations = await patternService.getRecommendations(args.taskId);
                 return {
                     content: [{ type: 'text', text: JSON.stringify(recommendations, null, 2) }],
@@ -181,8 +180,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${request.params.name}`);
         }
     } catch (error) {
-        console.error('Error handling request:', error);
-        
+        console.error('Error executing MCP tool:', error);
+
         if (error instanceof ValidationError || error instanceof z.ZodError) {
             throw new McpError(ErrorCode.InvalidParams, error.message);
         }
