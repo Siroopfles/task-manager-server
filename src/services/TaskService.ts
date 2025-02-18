@@ -1,4 +1,3 @@
-import { SimpleGit, simpleGit } from 'simple-git';
 import { join } from 'path';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
@@ -17,6 +16,7 @@ import { SQLiteTaskRepository } from '../repositories/TaskRepository.js';
 import { SQLiteCodeLocationRepository } from '../repositories/CodeLocationRepository.js';
 import { SQLiteImplementationRepository } from '../repositories/ImplementationRepository.js';
 import { getDatabase } from '../database/schema.js';
+import { GitService, RealGitService } from './GitService.js';
 
 interface CreateTaskOptions {
     title: string;
@@ -34,45 +34,31 @@ export class TaskService {
     private taskRepo: SQLiteTaskRepository;
     private codeLocationRepo: SQLiteCodeLocationRepository;
     private implRepo: SQLiteImplementationRepository;
-    private git: SimpleGit;
-    private repoRoot: string;
-    private mainBranch: string | null = null;
+    private gitService: GitService;
 
-    constructor(db?: Database, gitBaseDir?: string) {
+    constructor(db?: Database, gitServiceOrPath?: GitService | string) {
+        // Handle database initialization
         const dbInstance = db || getDatabase();
+        
         this.taskRepo = new SQLiteTaskRepository(dbInstance);
         this.codeLocationRepo = new SQLiteCodeLocationRepository(dbInstance);
         this.implRepo = new SQLiteImplementationRepository(dbInstance);
 
-        // Get the repository root path
-        this.repoRoot = gitBaseDir || this.getRepoRoot();
-        this.git = simpleGit({
-            baseDir: this.repoRoot,
-            maxConcurrentProcesses: 1
-        });
+        // Handle Git service initialization
+        if (!gitServiceOrPath) {
+            const repoRoot = this.getRepoRoot();
+            this.gitService = new RealGitService(repoRoot);
+        } else if (typeof gitServiceOrPath === 'string') {
+            this.gitService = new RealGitService(gitServiceOrPath);
+        } else {
+            this.gitService = gitServiceOrPath;
+        }
     }
 
     private getRepoRoot(): string {
         const __filename = fileURLToPath(import.meta.url);
         const __dirname = dirname(__filename);
         return join(__dirname, '..', '..');
-    }
-
-    private async getMainBranch(): Promise<string> {
-        if (!this.mainBranch) {
-            const branches = await this.git.branch();
-            this.mainBranch = branches.current;
-        }
-        return this.mainBranch;
-    }
-
-    private async doesBranchExist(branchName: string): Promise<boolean> {
-        try {
-            const branches = await this.git.branch();
-            return branches.all.includes(branchName);
-        } catch {
-            return false;
-        }
     }
 
     async findAll(filters?: Partial<Task>): Promise<Task[]> {
@@ -100,13 +86,7 @@ export class TaskService {
             });
 
             // Create a Git branch for the task
-            const branchName = `task/${createdTask.id}`;
-            try {
-                const mainBranch = await this.getMainBranch();
-                await this.git.checkoutBranch(branchName, mainBranch);
-            } catch (error) {
-                throw new GitError(`Failed to create branch ${branchName}: ${error instanceof Error ? error.message : 'Unknown error'}`);
-            }
+            await this.gitService.createBranch(createdTask.id);
 
             // If initial code location is provided, track it
             if (options.initialCodeLocation) {
@@ -115,7 +95,7 @@ export class TaskService {
                     file_path: options.initialCodeLocation.filePath,
                     start_line: options.initialCodeLocation.startLine,
                     end_line: options.initialCodeLocation.endLine,
-                    git_branch: branchName
+                    git_branch: `task/${createdTask.id}`
                 });
             }
 
@@ -124,9 +104,7 @@ export class TaskService {
             // Clean up Git branch if task creation fails
             if (error instanceof GitError && createdTask) {
                 try {
-                    const mainBranch = await this.getMainBranch();
-                    await this.git.checkout(mainBranch);
-                    await this.git.deleteLocalBranch(`task/${createdTask.id}`);
+                    await this.gitService.cleanupBranch(`task/${createdTask.id}`);
                 } catch {
                     // Ignore cleanup errors
                 }
@@ -147,19 +125,17 @@ export class TaskService {
 
         const branchName = `task/${taskId}`;
         try {
-            const currentBranch = (await this.git.revparse(['--abbrev-ref', 'HEAD'])).trim();
+            const currentBranch = await this.gitService.getCurrentBranch();
             if (currentBranch !== branchName) {
                 throw new GitError(`Must be on task branch ${branchName} to add code location`);
             }
 
-            const commit = (await this.git.revparse(['HEAD'])).trim();
             return this.codeLocationRepo.create({
                 task_id: taskId,
                 file_path: location.filePath,
                 start_line: location.startLine,
                 end_line: location.endLine,
-                git_branch: branchName,
-                git_commit: commit
+                git_branch: branchName
             });
         } catch (error) {
             if (error instanceof GitError) {
@@ -211,54 +187,12 @@ export class TaskService {
             throw new NotFoundError('Task', taskId);
         }
 
-        const branchName = `task/${taskId}`;
-        const mainBranch = await this.getMainBranch();
-
-        // First update task status - do this regardless of Git operations
-        await this.taskRepo.update(taskId, { status: TaskStatus.COMPLETED });
-
-        // Check if the task branch exists
-        const branchExists = await this.doesBranchExist(branchName);
-        if (!branchExists) {
-            // If no branch exists, task is already completed
-            console.log(`No branch ${branchName} found - task marked as completed`);
-            return;
-        }
-
         try {
-            // Get current branch to restore it later if needed
-            const currentBranch = (await this.git.revparse(['--abbrev-ref', 'HEAD'])).trim();
-
-            // Switch to main branch if not already there
-            if (currentBranch !== mainBranch) {
-                await this.git.checkout(mainBranch);
-            }
-
-            // Attempt to merge the task branch
-            console.log(`Merging branch ${branchName} into ${mainBranch}...`);
-            await this.git.merge([branchName]);
-
-            // Delete the task branch (without force)
-            console.log(`Deleting branch ${branchName}...`);
-            await this.git.deleteLocalBranch(branchName);
-
-            console.log('Task completed successfully');
+            await this.gitService.completeTask(taskId);
+            await this.taskRepo.update(taskId, { status: TaskStatus.COMPLETED });
         } catch (error) {
-            console.error('Git operation failed:', error);
-
-            // Try to abort any ongoing merge
-            try {
-                await this.git.merge(['--abort']);
-            } catch (abortError) {
-                console.error('Failed to abort merge:', abortError);
-            }
-
-            // Revert task status
             await this.taskRepo.update(taskId, { status: task.status });
-
-            throw new GitError(
-                `Failed to complete task: ${error instanceof Error ? error.message : 'Unknown error'}`
-            );
+            throw error;
         }
     }
 }

@@ -4,7 +4,6 @@ import { TaskService } from '../services/TaskService.js';
 import { TaskStatus, ValidationError } from '../models/types.js';
 
 const router = Router();
-const taskService = new TaskService();
 
 // Request type definitions
 interface CreateTaskRequest extends Request {
@@ -39,6 +38,11 @@ interface RecordImplementationRequest extends Request {
     };
 }
 
+// Get TaskService instance (supports injection for testing)
+const getTaskService = (req: Request): TaskService => {
+    return (req as any).taskService || new TaskService();
+};
+
 // Validation middleware
 const createTaskValidation = [
     body('title').notEmpty().trim().escape(),
@@ -53,6 +57,17 @@ const createTaskValidation = [
                 if (!value.filePath || !value.startLine) {
                     throw new Error('Initial code location requires filePath and startLine');
                 }
+            }
+            return true;
+        })
+];
+
+const statusValidation = [
+    query('status')
+        .optional()
+        .custom(value => {
+            if (value && !(value in TaskStatus)) {
+                throw new Error('Invalid task status');
             }
             return true;
         })
@@ -78,6 +93,7 @@ const handleValidationErrors = (req: Request, res: Response, next: NextFunction)
 // Create a new task
 router.post('/', createTaskValidation, handleValidationErrors, async (req: CreateTaskRequest, res: Response, next: NextFunction) => {
     try {
+        const taskService = getTaskService(req);
         const task = await taskService.createTask({
             title: req.body.title,
             description: req.body.description,
@@ -92,12 +108,10 @@ router.post('/', createTaskValidation, handleValidationErrors, async (req: Creat
 });
 
 // Get all tasks with optional status filter
-router.get('/', [
-    query('status').optional().isIn(Object.values(TaskStatus)),
-    handleValidationErrors
-], async (req: Request, res: Response, next: NextFunction) => {
+router.get('/', statusValidation, handleValidationErrors, async (req: Request, res: Response, next: NextFunction) => {
     try {
         const status = req.query.status as keyof typeof TaskStatus | undefined;
+        const taskService = getTaskService(req);
         const tasks = await taskService.findAll(status ? { status: TaskStatus[status] } : undefined);
         res.json(tasks);
     } catch (error) {
@@ -111,6 +125,7 @@ router.get('/:id', [
     handleValidationErrors
 ], async (req: Request, res: Response, next: NextFunction) => {
     try {
+        const taskService = getTaskService(req);
         const taskDetails = await taskService.getTaskWithDetails(req.params.id);
         res.json(taskDetails);
     } catch (error) {
@@ -127,6 +142,7 @@ router.post('/:id/locations', [
     handleValidationErrors
 ], async (req: AddCodeLocationRequest, res: Response, next: NextFunction) => {
     try {
+        const taskService = getTaskService(req);
         const location = await taskService.addCodeLocation(req.params.id, {
             filePath: req.body.filePath,
             startLine: req.body.startLine,
@@ -147,6 +163,7 @@ router.post('/:id/implementations', [
     handleValidationErrors
 ], async (req: RecordImplementationRequest, res: Response, next: NextFunction) => {
     try {
+        const taskService = getTaskService(req);
         const implementation = await taskService.recordImplementation(
             req.params.id,
             req.body.patternType,
@@ -165,6 +182,7 @@ router.post('/:id/complete', [
     handleValidationErrors
 ], async (req: Request, res: Response, next: NextFunction) => {
     try {
+        const taskService = getTaskService(req);
         await taskService.completeTask(req.params.id);
         res.status(200).json({ message: 'Task completed successfully' });
     } catch (error) {
